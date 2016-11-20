@@ -16,6 +16,7 @@
 #define NUM_COLS 28
 #define NUM_CHANNELS 1
 #define NUM_DIGITS 10
+#define TILE_WIDTH 8
 
 static int FLAGS_batch_size = 10000;
 static std::string FLAGS_testdata{};
@@ -133,6 +134,39 @@ static void conv_forward_valid(const float *X, const int xdims[4],
   }
 }
 
+// From book chapter Figure 16.12
+__global__ void conv_forward_kernel_0(const float *X, const int xdims[4],
+                               const float *W, const int wdims[4], float *Y,
+                               const int ydims[4]) {
+  const auto filter_h   = wdims[0];
+  const auto filter_w   = wdims[1];
+  const auto in_channel = wdims[2];
+  const auto W_grid = (ydims[2]-1)/TILE_WIDTH + 1;  // number of horizontal tiles per output map
+  //const auto H_grid = ydims[1]/TILE_WIDTH;  // number of vertical tiles per output map
+  const auto i = blockIdx.x;
+  const auto m = blockIdx.y;
+  const auto h = blockIdx.z / W_grid + threadIdx.y;
+  const auto w = blockIdx.z % W_grid + threadIdx.x;
+  if (h >= ydims[1] || w >= ydims[2]) return;	// check boundaries
+  float acc = 0;	// use temp var to store result, reduce global mem accessing of Y
+  for (const auto p : range(0, filter_h)) {
+    for (const auto q : range(0, filter_w)) {
+      for (const auto c : range(0, in_channel)) {
+        printf("i=%d, m=%d, h=%d, w=%d\n", i,m,h,w);
+        const auto xoffset = i * xdims[1] * xdims[2] * xdims[3] +
+                             (h + p) * xdims[2] * xdims[3] +
+                             (w + q) * xdims[3] + c;
+        const auto woffset = p * wdims[1] * wdims[2] * wdims[3] +
+                             q * wdims[2] * wdims[3] + c * wdims[3] + m;
+        acc += X[xoffset] * W[woffset];
+      }
+    }
+  }
+  const auto yoffset =
+                    ((i * ydims[1] + h) * ydims[2] + w) * ydims[3] + m;
+  Y[yoffset] = acc;
+}
+
 // Recified linear unit 4d
 static void relu4(float *X, const int xdims[4]) {
   for (const auto i : range(0, xdims[0] * xdims[1] * xdims[2] * xdims[3])) {
@@ -206,8 +240,37 @@ void forward_operation(float *x, float *conv1, float *conv2, float *fc1,
   // conv layer
   const int adims[] = {xdims[0], (xdims[1] - conv1dims[0] + 1),
                        (xdims[2] - conv1dims[1] + 1), conv1dims[3]};
-  auto a = zeros<float>(adims);
-  conv_forward_valid(x, xdims, conv1, conv1dims, a, adims);
+  auto a = zeros<float>(adims);		// output arr
+  
+  //conv_forward_valid(x, xdims, conv1, conv1dims, a, adims);
+
+  /* change 0 begin*/
+  float *d_x, *d_a, *d_conv1;
+  int *d_xdims, *d_adims, *d_conv1dims;
+  check_success(cudaMalloc((void**)&d_x, xdims[1]*xdims[2]*sizeof(float)));
+  check_success(cudaMalloc((void**)&d_a, adims[1]*adims[2]*sizeof(float)));
+  check_success(cudaMalloc((void**)&d_conv1, conv1dims[0]*conv1dims[1]*sizeof(float)));
+  check_success(cudaMalloc((void**)&d_xdims, 4*sizeof(int)));
+  check_success(cudaMalloc((void**)&d_adims, 4*sizeof(int)));
+  check_success(cudaMalloc((void**)&d_conv1dims, 4*sizeof(int)));
+
+  check_success(cudaMemcpy(d_x, x, xdims[1]*xdims[2]*sizeof(float), cudaMemcpyHostToDevice));
+  check_success(cudaMemcpy(d_conv1, conv1, conv1dims[0]*conv1dims[1]*sizeof(float), cudaMemcpyHostToDevice));
+  check_success(cudaMemcpy(d_xdims, xdims, 4*sizeof(int), cudaMemcpyHostToDevice));
+  check_success(cudaMemcpy(d_adims, adims, 4*sizeof(int), cudaMemcpyHostToDevice));
+  check_success(cudaMemcpy(d_conv1dims, conv1dims, 4*sizeof(int), cudaMemcpyHostToDevice));
+
+  auto W_grid = ceil(adims[2]/(TILE_WIDTH+0.0));
+  auto H_grid = ceil(adims[1]/(TILE_WIDTH+0.0));
+  auto Z = H_grid * W_grid;
+  dim3 blockDim(TILE_WIDTH, TILE_WIDTH, 1);
+  dim3 gridDim(adims[0], adims[3], Z);	// N,M,Z
+  conv_forward_kernel_0<<<gridDim, blockDim>>>(d_x, d_xdims, d_conv1, d_conv1dims, d_a, d_adims);
+  cudaDeviceSynchronize();
+
+  check_success(cudaMemcpy(a, d_a, adims[1]*adims[2]*sizeof(float), cudaMemcpyDeviceToHost));
+  cudaFree(d_x); cudaFree(d_a); cudaFree(d_conv1); cudaFree(d_xdims); cudaFree(d_adims); cudaFree(d_conv1dims);
+  /* change 0 end */
 
   /// relu layer
   relu4(a, adims);
